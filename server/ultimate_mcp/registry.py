@@ -1,8 +1,4 @@
-"""Registry — manifest loading, capability gating, search, lazy dispatch (W0).
-
-Only ~10 real MCP tools are exposed; the 150+ virtual tools live in surface
-manifests and are reached via umcp_search_tools / umcp_call.
-"""
+"""Registry — manifest loading, capability gating, search, lazy dispatch (W0)."""
 
 from __future__ import annotations
 
@@ -16,13 +12,18 @@ from ultimate_mcp.spec import SurfaceSpec, Tier, ToolSpec
 SURFACE_MODULES = [
     "ultimate_mcp.tools.database.manifest",
     "ultimate_mcp.tools.storage.manifest",
-    # W1: "ultimate_mcp.tools.supervisor.manifest", "ultimate_mcp.tools.hacs.manifest",
-    # W2: "ultimate_mcp.tools.filesystem.manifest", "ultimate_mcp.tools.dashboards.manifest",
-    # W3: "ultimate_mcp.tools.diagnostics.manifest", "ultimate_mcp.tools.stats_repair.manifest",
-    # W4: "ultimate_mcp.tools.network.manifest", "ultimate_mcp.tools.zigbee.manifest",
-    #     "ultimate_mcp.tools.realtime.manifest",
-    # W5: "ultimate_mcp.tools.registries.manifest", "ultimate_mcp.tools.assist.manifest",
-    #     "ultimate_mcp.tools.media_camera.manifest",
+    "ultimate_mcp.tools.supervisor.manifest",
+    "ultimate_mcp.tools.hacs.manifest",
+    "ultimate_mcp.tools.filesystem.manifest",
+    "ultimate_mcp.tools.dashboards.manifest",
+    "ultimate_mcp.tools.diagnostics.manifest",
+    "ultimate_mcp.tools.stats_repair.manifest",
+    "ultimate_mcp.tools.network.manifest",
+    "ultimate_mcp.tools.zigbee.manifest",
+    "ultimate_mcp.tools.realtime.manifest",
+    "ultimate_mcp.tools.registries.manifest",
+    "ultimate_mcp.tools.assist.manifest",
+    "ultimate_mcp.tools.media_camera.manifest",
 ]
 
 
@@ -46,7 +47,6 @@ class Registry:
                 self.tools[spec.name] = RegisteredTool(spec=spec, surface=surface)
 
     def apply_gates(self, fingerprint: dict[str, Any]) -> None:
-        """Evaluate `requires` predicates against the fingerprint capability set."""
         caps: set[str] = set(fingerprint.get("capabilities", []))
         for rt in self.tools.values():
             missing = [
@@ -61,7 +61,6 @@ class Registry:
     def search(
         self, query: str, surface: str | None = None, max_results: int = 10
     ) -> list[dict[str, Any]]:
-        """Naive keyword scorer; W0 upgrades this to BM25 over name+summary+keywords."""
         terms = [t for t in query.lower().split() if t]
         scored: list[tuple[int, RegisteredTool]] = []
         for rt in self.tools.values():
@@ -93,7 +92,6 @@ class Registry:
         }
 
     async def dispatch(self, ctx: Any, name: str, args: dict[str, Any]) -> Any:
-        """Lazy-import the surface impl and invoke the tool coroutine."""
         rt = self.tools.get(name)
         if rt is None:
             raise KeyError(f"unknown tool: {name}")

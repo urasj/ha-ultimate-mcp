@@ -62,7 +62,19 @@ async def collect_fingerprint(ctx: Context) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
 
-    # Custom components + integrations (W0: extend via WS config_entries/get)
+    # Loaded integrations -> integration:<domain> capabilities (drives gating for
+    # zigbee/assist/etc.). /api/config.components lists loaded integrations+platforms.
+    try:
+        cfg = await ctx.supervisor.core_api("GET", "config")
+        components = (cfg or {}).get("components", []) if isinstance(cfg, dict) else []
+        integrations = sorted({c.split(".")[0] for c in components})
+        fp["integrations"] = integrations
+        for domain in integrations:
+            caps.append(f"integration:{domain}")
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully
+        fp["integrations"] = {"error": str(exc)}
+
+    # Custom components
     cc_dir = ctx.fs.root / "custom_components"
     if cc_dir.is_dir():
         fp["custom_components"] = sorted(p.name for p in cc_dir.iterdir() if p.is_dir())
