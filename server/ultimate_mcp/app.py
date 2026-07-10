@@ -7,6 +7,7 @@ Transport: streamable HTTP on 0.0.0.0:8099/mcp, bearer-token gated.
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 from typing import Any
@@ -52,14 +53,21 @@ async def umcp_describe_tool(name: str) -> dict[str, Any]:
 @mcp.tool()
 async def umcp_call(
     name: str,
-    args: dict[str, Any] | None = None,
+    args: dict[str, Any] | str | None = None,
     dry_run: bool = True,
     confirm_token: str | None = None,
     external_checkpoint_ref: str | None = None,
 ) -> Any:
     """Invoke a virtual tool. Mutating tools default to dry_run=True and return a
     plan + confirm_token; call again with dry_run=False (+ token for T3)."""
+    # Some MCP client bridges serialize the nested `args` object into a JSON
+    # string before it reaches us — coerce it back so parameterized tools work.
+    if isinstance(args, str):
+        s = args.strip()
+        args = json.loads(s) if s else {}
     args = args or {}
+    if not isinstance(args, dict):
+        raise ValueError(f"args must be an object, got {type(args).__name__}")
     await _safety.authorize(_registry, name, dry_run, confirm_token, external_checkpoint_ref)
     if dry_run:
         args["dry_run"] = True
@@ -169,17 +177,4 @@ def build_asgi_app() -> Any:
     log.info("loaded %d virtual tools", len(_registry.tools))
     # Stateful mode (default): FastMCP issues an Mcp-Session-Id and serves the
     # GET /mcp SSE stream that streamable-HTTP clients (e.g. mcp-remote) open to
-    # keep the session alive. stateless_http=True broke that (GET /mcp -> 405).
-    inner = mcp.http_app()
-    return BearerAuthASGI(inner, token)
-
-
-def main() -> None:
-    import uvicorn
-
-    logging.basicConfig(level=os.environ.get("UMCP_LOG_LEVEL", "info").upper())
-    uvicorn.run(build_asgi_app(), host="0.0.0.0", port=8099, log_level="info")
-
-
-if __name__ == "__main__":
-    main()
+    # keep t

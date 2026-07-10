@@ -18,3 +18,9 @@
   realtime (wait/subscribe/watchdog), registries, assist (conversation/pipeline),
   and media_camera surfaces. Fingerprint now emits integration:* capabilities for
   accurate gating. 190 tests.
+
+## 0.2.1
+
+- umcp_call now coerces a stringified `args` back into an object, so
+  parameterized tools work from MCP clients that serialize nested args
+  (e.g. Cowork). Unblocks all write tools from those clients.
