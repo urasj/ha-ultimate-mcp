@@ -1,5 +1,5 @@
 name: "Ultimate MCP"
-version: "0.1.0"
+version: "0.1.1"
 slug: "ultimate_mcp"
 description: "Deep system-level MCP server: Supervisor, filesystem, recorder DB, MQTT/ZHA internals, diagnostics"
 url: "https://github.com/urasj/ha-ultimate-mcp"

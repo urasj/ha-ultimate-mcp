@@ -103,8 +103,17 @@ class BearerAuthASGI:
         if scope["type"] == "lifespan":
             await self.inner(scope, receive, send)
             return
-        if scope["type"] == "http" and scope.get("path") == "/health":
+        path = scope.get("path", "")
+        if scope["type"] == "http" and path == "/health":
             await self._respond_health(send)
+            return
+        # OAuth-discovery probes must 404 (not 401) so MCP clients like
+        # mcp-remote conclude "no OAuth here" and fall back to the static
+        # bearer header instead of trying to start an OAuth flow.
+        if scope["type"] == "http" and (
+            path.startswith("/.well-known/") or path == "/register"
+        ):
+            await self._respond_404(send)
             return
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization", b"").decode("latin-1")
@@ -140,6 +149,17 @@ class BearerAuthASGI:
         )
         await send({"type": "http.response.body", "body": b'{"status":"ok"}'})
 
+    @staticmethod
+    async def _respond_404(send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b'{"error":"not found"}'})
+
 
 def build_asgi_app() -> Any:
     token = _ctx.options.get("auth_token", "")
@@ -147,10 +167,10 @@ def build_asgi_app() -> Any:
         raise SystemExit("auth_token is empty — set it in the add-on options")
     _registry.load_manifests()
     log.info("loaded %d virtual tools", len(_registry.tools))
-    try:
-        inner = mcp.http_app(stateless_http=True)
-    except TypeError:  # older fastmcp without stateless_http kwarg
-        inner = mcp.http_app()
+    # Stateful mode (default): FastMCP issues an Mcp-Session-Id and serves the
+    # GET /mcp SSE stream that streamable-HTTP clients (e.g. mcp-remote) open to
+    # keep the session alive. stateless_http=True broke that (GET /mcp -> 405).
+    inner = mcp.http_app()
     return BearerAuthASGI(inner, token)
 
 
