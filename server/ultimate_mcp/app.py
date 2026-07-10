@@ -178,16 +178,16 @@ def build_asgi_app() -> Any:
     # Stateful mode (default): FastMCP issues an Mcp-Session-Id and serves the
     # GET /mcp SSE stream that streamable-HTTP clients (e.g. mcp-remote) open to
     # keep the session alive. stateless_http=True broke that (GET /mcp -> 405).
-       inner = mcp.http_app()
-       return BearerAuthASGI(inner, token)
+    inner = mcp.http_app()
+    return BearerAuthASGI(inner, token)
 
 
-   def main() -> None:
-       import uvicorn
+def main() -> None:
+    import uvicorn
 
-       logging.basicConfig(level=os.environ.get("UMCP_LOG_LEVEL", "info").upper())
-       uvicorn.run(build_asgi_app(), host="0.0.0.0", port=8099, log_level="info")
+    logging.basicConfig(level=os.environ.get("UMCP_LOG_LEVEL", "info").upper())
+    uvicorn.run(build_asgi_app(), host="0.0.0.0", port=8099, log_level="info")
 
 
-   if __name__ == "__main__":
-       main()
+if __name__ == "__main__":
+    main()
