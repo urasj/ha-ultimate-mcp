@@ -1,4 +1,4 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.21
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.24
 FROM $BUILD_FROM
 
 ENV PIP_NO_CACHE_DIR=1 \
@@ -8,7 +8,7 @@ ENV PIP_NO_CACHE_DIR=1 \
 COPY server /opt/umcp
 RUN pip install --no-cache-dir /opt/umcp
 
-COPY rootfs /
+COPY ultimate-mcp/rootfs /
 
 HEALTHCHECK --interval=60s --timeout=10s \
     CMD wget -qO- http://127.0.0.1:8099/health || exit 1
