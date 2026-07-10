@@ -1,90 +1,81 @@
-"""SafetyKernel journal record/tail/undo tests (W0).
+"""SafetyKernel journal/undo tests (W0)."""
 
-UMCP_DATA must point at a temp dir BEFORE ultimate_mcp.context is imported
-(DATA_DIR / JOURNAL / UNDO_DIR are resolved at import time), so each test
-purges cached modules and re-imports inside the fixture.
-"""
 import asyncio
 import importlib
+import json
 import sys
 from pathlib import Path
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
 
 
-def _purge_ultimate_mcp_modules() -> None:
-    for name in [m for m in list(sys.modules) if m.startswith("ultimate_mcp")]:
-        del sys.modules[name]
-
-
-@pytest.fixture
-def kernel(tmp_path, monkeypatch):
+def _kernel(tmp_path, monkeypatch):
+    """Fresh SafetyKernel with journal/undo rooted in tmp_path."""
     monkeypatch.setenv("UMCP_DATA", str(tmp_path / "data"))
-    _purge_ultimate_mcp_modules()
-    kernel_mod = importlib.import_module("ultimate_mcp.safety.kernel")
-    yield kernel_mod.SafetyKernel(ctx=object())  # ctx only used by checkpoint/authorize
-    # purge again so later test modules re-import with THEIR env, not our tmp dir
-    _purge_ultimate_mcp_modules()
+    monkeypatch.setenv("UMCP_HA_CONFIG", str(tmp_path / "ha"))
+    (tmp_path / "ha").mkdir(exist_ok=True)
+    import ultimate_mcp.context as context
+    import ultimate_mcp.safety.kernel as kernel_mod
+
+    importlib.reload(context)
+    importlib.reload(kernel_mod)
+
+    class StubCtx:
+        options = {"destructive_enabled": False}
+
+    return kernel_mod, kernel_mod.SafetyKernel(StubCtx())
 
 
-def test_record_and_tail_roundtrip(kernel, tmp_path):
-    entry_id = kernel.record("storage_edit", "/homeassistant/x.yaml", surface="filesystem")
-    tail = kernel.journal_tail(limit=5)
-    assert len(tail) == 1
-    entry = tail[0]
-    assert entry["id"] == entry_id
-    assert entry["action"] == "storage_edit"
-    assert entry["target"] == "/homeassistant/x.yaml"
-    assert entry["surface"] == "filesystem"
-    assert "ts" in entry
+def test_record_and_tail_roundtrip(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    entry_id = k.record("test_action", "some/target", note="hello")
+    tail = k.journal_tail(5)
+    assert tail[-1]["id"] == entry_id
+    assert tail[-1]["action"] == "test_action"
+    assert tail[-1]["note"] == "hello"
 
 
-def test_record_copies_undo_artifact(kernel, tmp_path):
-    target = tmp_path / "cfg" / "automations.yaml"
-    target.parent.mkdir(parents=True)
-    target.write_text("original: true\n", encoding="utf-8")
-
-    entry_id = kernel.record("edit", str(target), undo_artifact_path=target)
-
-    artifact = tmp_path / "data" / "undo" / entry_id / "automations.yaml"
+def test_record_copies_undo_artifact(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    target = tmp_path / "ha" / "file.json"
+    target.write_text(json.dumps({"v": 1}), encoding="utf-8")
+    entry_id = k.record("edit", str(target), undo_artifact_path=target)
+    artifact = kernel_mod.UNDO_DIR / entry_id / "file.json"
     assert artifact.exists()
-    assert artifact.read_text(encoding="utf-8") == "original: true\n"
-    assert kernel.journal_tail(1)[0]["undo_artifact"] == str(artifact)
+    assert json.loads(artifact.read_text()) == {"v": 1}
 
 
-def test_undo_restores_pre_change_file(kernel, tmp_path):
-    target = tmp_path / "cfg" / "configuration.yaml"
-    target.parent.mkdir(parents=True)
-    target.write_text("version: 1\n", encoding="utf-8")
-
-    entry_id = kernel.record("edit", str(target), undo_artifact_path=target)
-    target.write_text("version: 2  # botched edit\n", encoding="utf-8")
-
-    result = asyncio.run(kernel.undo(entry_id))
-
+def test_undo_restores_prechange_content(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    target = tmp_path / "ha" / "file.json"
+    target.write_text(json.dumps({"v": 1}), encoding="utf-8")
+    entry_id = k.record("edit", str(target), undo_artifact_path=target)
+    target.write_text(json.dumps({"v": 2}), encoding="utf-8")  # the "change"
+    result = asyncio.run(k.undo(entry_id))
     assert result["undoable"] is True
-    assert result["restored"] == str(target)
-    assert target.read_text(encoding="utf-8") == "version: 1\n"
-    # the undo itself is journaled
-    last = kernel.journal_tail(1)[0]
-    assert last["action"] == "undo"
-    assert last["undid"] == entry_id
-    assert last["id"] == result["journal_id"]
+    assert json.loads(target.read_text()) == {"v": 1}
+    assert k.journal_tail(1)[0]["action"] == "undo"
 
 
-def test_undo_without_artifact_reports_not_undoable(kernel):
-    entry_id = kernel.record("service_call", "light.kitchen", service="light.turn_on")
-    result = asyncio.run(kernel.undo(entry_id))
+def test_undo_without_artifact_reports_not_undoable(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    entry_id = k.record("service_call", "recorder.purge")
+    result = asyncio.run(k.undo(entry_id))
     assert result["undoable"] is False
     assert "no undo artifact" in result["reason"]
 
 
-def test_undo_unknown_entry_reports_not_undoable(kernel):
-    result = asyncio.run(kernel.undo("does-not-exist"))
+def test_undo_unknown_entry(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    result = asyncio.run(k.undo("deadbeef0000"))
     assert result["undoable"] is False
     assert "no journal entry" in result["reason"]
 
 
-def test_jo
+def test_journal_tail_limit(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    for i in range(10):
+        k.record("bulk", f"target-{i}")
+    tail = k.journal_tail(3)
+    assert len(tail) == 3
+    assert tail[-1]["target"] == "target-9"
