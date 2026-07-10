@@ -7,14 +7,18 @@ routes through this kernel.
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import shutil
 import time
+from pathlib import Path
 from typing import Any
 
 from ultimate_mcp.context import DATA_DIR, Context
 from ultimate_mcp.spec import Tier
 
 JOURNAL = DATA_DIR / "journal.jsonl"
+UNDO_DIR = DATA_DIR / "undo"
 
 
 class SafetyKernel:
@@ -77,6 +81,79 @@ class SafetyKernel:
         lines = JOURNAL.read_text(encoding="utf-8").strip().splitlines()
         return [json.loads(ln) for ln in lines[-limit:]]
 
+    def _journal_find(self, entry_id: str) -> dict[str, Any] | None:
+        if not JOURNAL.exists():
+            return None
+        for ln in JOURNAL.read_text(encoding="utf-8").strip().splitlines():
+            entry = json.loads(ln)
+            if entry.get("id") == entry_id:
+                return entry
+        return None
+
+    def record(
+        self,
+        action: str,
+        target: str,
+        undo_artifact_path: str | os.PathLike | None = None,
+        **meta: Any,
+    ) -> str:
+        """Journal a mutation. Tool impls call this BEFORE changing `target`.
+
+        If undo_artifact_path is given (usually the target file itself, pre-change,
+        or a saved copy of it), it is copied to /data/undo/<entry_id>/ so
+        undo(entry_id) can atomically restore it to `target` later. Returns the
+        journal entry id.
+        """
+        entry_id = secrets.token_hex(6)
+        entry: dict[str, Any] = {"id": entry_id, "action": action, "target": target, **meta}
+        if undo_artifact_path is not None:
+            src = Path(undo_artifact_path)
+            dest_dir = UNDO_DIR / entry_id
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / src.name
+            shutil.copy2(src, dest)
+            entry["undo_artifact"] = str(dest)
+        self._journal(entry)
+        return entry_id
+
     async def undo(self, entry_id: str) -> dict[str, Any]:
-        # W0: replay inverse ops from /data/undo/<entry_id>/ artifacts
-        raise NotImplementedError("undo replay lands with storage_editor (W2)")
+        """Restore the pre-change artifact for a journaled entry (atomic os.replace).
+
+        Entries recorded without an undo artifact (service calls, checkpoints, …)
+        are reported as not undoable rather than raising.
+        """
+        entry = self._journal_find(entry_id)
+        if entry is None:
+            return {"undoable": False, "reason": f"no journal entry with id {entry_id!r}"}
+        artifact = entry.get("undo_artifact")
+        if not artifact:
+            return {
+                "undoable": False,
+                "reason": f"entry {entry_id!r} ({entry.get('action')}) has no undo artifact",
+            }
+        artifact_path = Path(artifact)
+        if not artifact_path.exists():
+            return {"undoable": False, "reason": f"undo artifact missing: {artifact}"}
+        target = Path(str(entry.get("target", "")))
+        if not str(target):
+            return {"undoable": False, "reason": f"entry {entry_id!r} has no restore target"}
+        # /data and the target mount may be different filesystems, so a direct
+        # os.replace(artifact, target) could fail with EXDEV. Copy the artifact
+        # to a temp file NEXT TO the target, then os.replace — still atomic.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.parent / f".{target.name}.umcp-undo-{secrets.token_hex(4)}"
+        try:
+            shutil.copy2(artifact_path, tmp)
+            os.replace(tmp, target)
+        finally:
+            if tmp.exists():  # only on failure between copy and replace
+                tmp.unlink(missing_ok=True)
+        undo_journal_id = self._journal(
+            {"action": "undo", "target": str(target), "undid": entry_id}
+        )
+        return {
+            "undoable": True,
+            "restored": str(target),
+            "entry_id": entry_id,
+            "journal_id": undo_journal_id,
+        }

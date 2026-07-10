@@ -5,8 +5,10 @@ Transport: streamable HTTP on 0.0.0.0:8099/mcp, bearer-token gated.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import secrets
 from typing import Any
 
 from fastmcp import FastMCP
@@ -90,17 +92,16 @@ async def umcp_health() -> dict[str, Any]:
     return {"status": "ok", "tools_total": total, "tools_available": avail}
 
 
-def main() -> None:
-    logging.basicConfig(level=os.environ.get("UMCP_LOG_LEVEL", "info").upper())
-    token = _ctx.options.get("auth_token", "")
-    if not token:
-        raise SystemExit("auth_token is empty — set it in the add-on options")
-    _registry.load_manifests()
-    log.info("loaded %d virtual tools", len(_registry.tools))
-    # NOTE(W0): add bearer-token middleware + /health route on the underlying app,
-    # verify stateless_http for multi-client LAN use.
-    mcp.run(transport="http", host="0.0.0.0", port=8099)
+class BearerAuthASGI:
+    """Pure-ASGI wrapper around the FastMCP streamable-HTTP app.
 
+    - GET/HEAD /health -> {"status": "ok"} with NO auth (Supervisor watchdog).
+    - Every other http/websocket request must send `Authorization: Bearer <token>`
+      matching the add-on's auth_token option (constant-time compare) or gets 401.
+    - lifespan scope passes through untouched so FastMCP's session manager starts.
+    """
 
-if __name__ == "__main__":
-    main()
+    HEALTH_PATHS = ("/health", "/health/")
+
+    def __init__(self, inner: Any, token: str) -> None:
+        self.inner = 
