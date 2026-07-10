@@ -1,0 +1,59 @@
+name: "Ultimate MCP"
+version: "0.1.0"
+slug: "ultimate_mcp"
+description: "Deep system-level MCP server: Supervisor, filesystem, recorder DB, MQTT/ZHA internals, diagnostics"
+url: "https://github.com/urasj/ha-ultimate-mcp"
+arch:
+  - amd64
+  - aarch64
+image: "ghcr.io/urasj/{arch}-ultimate-mcp"
+init: false
+homeassistant: "2026.7.0"
+startup: services
+boot: auto
+
+hassio_api: true
+hassio_role: manager
+homeassistant_api: true
+auth_api: false
+
+map:
+  - type: homeassistant_config
+    read_only: false
+  - type: addon_config
+    read_only: false
+  - type: all_addon_configs
+    read_only: false
+  - type: ssl
+    read_only: true
+  - type: share
+    read_only: false
+  - type: media
+    read_only: false
+  - type: backup
+    read_only: true
+
+host_network: false
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "MCP streamable-HTTP endpoint (/mcp)"
+ingress: false
+
+services:
+  - mqtt:want
+
+watchdog: "http://[HOST]:[PORT:8099]/health"
+
+options:
+  log_level: info
+  auth_token: ""
+  enabled_surfaces:
+    - all
+  destructive_enabled: false
+schema:
+  log_level: "list(debug|info|warning|error)"
+  auth_token: "password"
+  enabled_surfaces:
+    - str
+  destructive_enabled: bool

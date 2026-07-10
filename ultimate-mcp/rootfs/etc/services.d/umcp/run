@@ -1,0 +1,7 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Start the Ultimate MCP server
+# ==============================================================================
+bashio::log.info "Starting Ultimate MCP server..."
+export UMCP_LOG_LEVEL="$(bashio::config 'log_level')"
+exec python3 -m ultimate_mcp
