@@ -1,0 +1,78 @@
+name: Publish add-on images
+
+# Builds the add-on container images with the official home-assistant/builder
+# and pushes them to ghcr.io/<owner>/{arch}-ultimate-mcp tagged with the
+# add-on version from ultimate-mcp/config.yaml (plus :latest).
+#
+# Runs on: pushes to main that change the add-on version, version tags (v*),
+# and manual dispatch.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decide whether the add-on version changed
+        id: check
+        run: |
+          version="$(sed -n 's/^version: *"\(.*\)"/\1/p' ultimate-mcp/config.yaml)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.ref_type }}" == "tag" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Branch push: build only if the version differs from before the push.
+          base="${{ github.event.before }}"
+          if [[ -z "$base" ]] || [[ "$base" =~ ^0+$ ]] || ! git cat-file -e "$base" 2>/dev/null; then
+            base="HEAD^"
+          fi
+          previous="$(git show "${base}:ultimate-mcp/config.yaml" 2>/dev/null | sed -n 's/^version: *"\(.*\)"/\1/p' || true)"
+          if [[ "${version}" != "${previous}" ]]; then
+            echo "Version ${previous:-<none>} -> ${version}: building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged (${version}): skipping image build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: init
+    if: needs.init.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    name: Build ${{ matrix.arch }} (${{ needs.init.outputs.version }})
+    strategy:
+      matrix:
+        # Keep in sync with the arch list in ultimate-mcp/config.yaml.
+        arch: [amd64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push ${{ matrix.arch }} image
+        uses: home-assistant/builder@2026.06.0
+        with:
+          args: |
+            --${{ matrix.arch }} \
+            --target /data/ultimate-mcp \
+            --image "{arch}-ultimate-mcp" \
+            --docker-hub "ghcr.io/${{ github.repository_owner }}" \
+            --addon
