@@ -15,4 +15,8 @@ jobs:
           python-version: "3.12"
       - run: pip install -e "server[dev]"
       - run: ruff check server
+      # Import guard: sync corruption has truncated modules in this repo before
+      # (b14fbff, 0.2.1). compileall catches syntax-level truncation; the
+      # import-all test (tests/test_imports.py) catches half-written modules.
+      - run: python -m compileall -q server
       - run: python -m pytest tests -q
