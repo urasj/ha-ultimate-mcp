@@ -1,6 +1,6 @@
 [project]
 name = "ultimate-mcp"
-version = "0.2.4"
+version = "0.2.5"
 description = "Ultimate MCP Server for Home Assistant - deep system-level toolset"
 requires-python = ">=3.12"
 dependencies = [

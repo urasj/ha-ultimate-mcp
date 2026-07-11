@@ -61,3 +61,29 @@
   endpoints return text/plain, not JSON).
 - New `go2rtc_url` add-on option plumbed to the media_camera surface
   (`stream_health_report` etc.) for go2rtc running as a separate add-on.
+
+## 0.2.5
+
+- **Atomic T1+/T2/T3 applies (journal-before-mutate).** Root cause of the
+  0.2.4 field defect: `POST /core/start` sat between the .storage write and
+  the journal append with the client-default 30 s timeout, while Supervisor
+  blocks that call until core is up (60-120 s) — the ReadTimeout aborted the
+  flow post-write/pre-journal, leaving an applied-but-unjournaled mutation
+  and a generic error. The journal is now write-ahead: a `pending` entry
+  (including the undo pre-image) is persisted before any write and marked
+  `committed` after — for every T1+ path via the gateway, and inside
+  StorageEditor for .storage edits. `umcp_journal` surfaces entry `status`
+  (pending / committed / failed / no_op / rolled_back / superseded /
+  unknown); `umcp_undo` works on pending and committed entries alike.
+- **Applies return promptly and never mask an applied mutation.** Core start
+  is fired with a short timeout and reported as structured status
+  (`core_restart: started | in_progress | start_failed`) instead of blocking
+  on the boot (production sits behind a 90 s proxy) or raising. Removed the
+  old wait-poll behavior that ROLLED BACK a committed write when core was
+  slow to reboot. Explicit timeouts on the backup (300 s) and stop (90 s)
+  calls.
+- **Idempotent-safe re-applies.** Retrying an apply whose response was lost
+  returns `{applied: true, no_op: true}` without a second backup/stop/write
+  cycle: storage_patch detects a patch already reflected in the document
+  (including `remove` of a now-absent key), and StorageEditor no-ops when
+  the mutated documents equal the originals.
