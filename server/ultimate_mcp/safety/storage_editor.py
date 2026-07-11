@@ -1,16 +1,23 @@
-"""StorageEditor — the stop→backup→atomic-edit→validate→start protocol (W2).
+"""StorageEditor — the backup→stop→journal-first→atomic-edit→validate→start
+protocol (W2, apply ordering reworked in 0.2.5).
 
 Single implementation every .storage-mutating tool routes through
 (architecture.md §4 ".storage edit protocol"):
 
-  1. partial backup (homeassistant: true) via ctx.supervisor
+  1. partial backup (homeassistant: true) via ctx.supervisor (generous timeout)
   2. POST /core/stop
-  3. copy target file(s) to /data/undo/<undo_id>/
-  4. edit as tmp-file + os.replace (atomic)
-  5. json re-parse + schema sanity ("version"/"key" intact, "data" present)
-  6. POST /core/start, poll /core/info until RUNNING (120s guard)
-  7. journal entry
-On any failure after stop: restore copies, start core, re-raise with context.
+  3. copy target file(s) to /data/undo/<undo_id>/ (pre-images, BEFORE any write)
+  4. write-ahead journal entry: status "pending", referencing the undo copies —
+     from here the change is discoverable and reversible even if we die mid-write
+  5. edit as tmp-file + os.replace (atomic), json re-parse + schema sanity
+     ("version"/"key" intact, "data" present); on failure: restore copies, mark
+     the entry rolled_back, fire core start, re-raise
+  6. mark the journal entry "committed" — the mutation is now done
+  7. POST /core/start with a SHORT timeout and return immediately. Core takes
+     60-120 s to boot and production sits behind a 90 s proxy, so the response
+     never blocks on the boot: `core_restart` reports started / in_progress /
+     start_failed, and a start hiccup is NEVER reported as a mutation failure
+     (the write already committed).
 
 All Supervisor interaction goes through ctx.supervisor and all filesystem
 paths resolve through ctx.fs, so tests can stub both uniformly.
@@ -18,7 +25,6 @@ paths resolve through ctx.fs, so tests can stub both uniformly.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import copy
 import json
@@ -27,9 +33,11 @@ import secrets
 import shutil
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from ultimate_mcp.context import DATA_DIR, Context
 
@@ -85,14 +93,14 @@ class StorageEditor:
         self,
         ctx: Context,
         *,
-        start_timeout: float = 120.0,
-        poll_interval: float = 2.0,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        backup_timeout: float = 300.0,
+        stop_timeout: float = 90.0,
+        start_post_timeout: float = 10.0,
     ) -> None:
         self.ctx = ctx
-        self.start_timeout = start_timeout
-        self.poll_interval = poll_interval
-        self._sleep = sleep
+        self.backup_timeout = backup_timeout
+        self.stop_timeout = stop_timeout
+        self.start_post_timeout = start_post_timeout
 
     # -- public API -----------------------------------------------------
     async def edit(
@@ -145,60 +153,52 @@ class StorageEditor:
         if dry_run:
             return {"would_change": diff, "checkpoint_required": "partial:homeassistant"}
 
-        # 2. checkpoint: partial backup scoped to homeassistant
+        # Idempotency backstop: a retried apply whose change already landed
+        # must not stop core / write / journal again.
+        if all(o == m for _, o, m in storage_plans) and all(b == a for _, b, a in text_plans):
+            return {
+                "applied": True,
+                "no_op": True,
+                "changed": {},
+                "note": "document(s) already reflect this change; nothing was written",
+            }
+
+        # 1. checkpoint: partial backup scoped to homeassistant (can be slow)
         backup = await self.ctx.supervisor.post(
             "/backups/new/partial",
             {"name": f"umcp-{name_hint}-{int(time.time())}", "homeassistant": True},
+            timeout=self.backup_timeout,
         )
         slug = (backup.get("data") or {}).get("slug", "")
 
-        # 3. stop core before touching .storage
-        await self.ctx.supervisor.post("/core/stop")
+        # 2. stop core before touching .storage (failure here is a clean abort:
+        # nothing has been written yet)
+        await self.ctx.supervisor.post("/core/stop", timeout=self.stop_timeout)
 
         undo_id = f"{int(time.time())}-{secrets.token_hex(4)}"
         undo_dir = UNDO_ROOT / undo_id
         undo_dir.mkdir(parents=True, exist_ok=True)
         restored: list[tuple[Path, Path]] = []  # (undo_copy, live_path)
 
-        try:
-            # 4. undo copies + atomic writes
-            for key, _original, mutated in storage_plans:
-                live = self.ctx.fs.resolve(f".storage/{key}")
-                undo_copy = undo_dir / f".storage__{key}"
-                shutil.copy2(live, undo_copy)
-                restored.append((undo_copy, live))
-                self._atomic_write(live, json.dumps(mutated, ensure_ascii=False, indent=2))
-                # 5. re-parse + sanity check what actually landed on disk
-                reparsed = json.loads(live.read_text(encoding="utf-8"))
-                self._sanity(key, _original, reparsed)
+        # 3. pre-image copies for EVERY file, before any write
+        for key, _original, _mutated in storage_plans:
+            live = self.ctx.fs.resolve(f".storage/{key}")
+            undo_copy = undo_dir / f".storage__{key}"
+            shutil.copy2(live, undo_copy)
+            restored.append((undo_copy, live))
+        for rel, _before, _after in text_plans:
+            live = self.ctx.fs.resolve(rel)
+            undo_copy = undo_dir / rel.replace("/", "__")
+            shutil.copy2(live, undo_copy)
+            restored.append((undo_copy, live))
 
-            for rel, _before, after in text_plans:
-                live = self.ctx.fs.resolve(rel)
-                undo_copy = undo_dir / rel.replace("/", "__")
-                shutil.copy2(live, undo_copy)
-                restored.append((undo_copy, live))
-                self._atomic_write(live, after)
-        except Exception as exc:
-            self._rollback(restored)
-            await self.ctx.supervisor.post("/core/start")
-            raise RuntimeError(f"storage edit failed and was rolled back (undo {undo_id}): {exc}") from exc
-
-        # 6. start core and verify it comes back
-        await self.ctx.supervisor.post("/core/start")
-        try:
-            await self._wait_core_running()
-        except Exception as exc:
-            # timeout guard: auto-restore the copies and start again
-            self._rollback(restored)
-            await self.ctx.supervisor.post("/core/start")
-            raise RuntimeError(
-                f"core did not return to RUNNING after edit; files restored (undo {undo_id}): {exc}"
-            ) from exc
-
-        # 7. journal
+        # 4. write-ahead journal: pending entry referencing the undo copies.
+        # From here on, a crash at any point leaves a discoverable, undoable
+        # record — the entry is only marked committed after the writes land.
         entry_id = self._journal(
             {
                 "action": "storage_edit",
+                "status": "pending",
                 "hint": name_hint,
                 "backup_slug": slug,
                 "undo_id": undo_id,
@@ -207,7 +207,41 @@ class StorageEditor:
                 "diff": diff,
             }
         )
-        return {"changed": diff, "undo_id": undo_id, "backup_slug": slug, "journal_id": entry_id}
+
+        try:
+            # 5. atomic writes + re-parse sanity of what actually landed
+            for (key, _original, mutated), (_copy, live) in zip(
+                storage_plans, restored[: len(storage_plans)]
+            ):
+                self._atomic_write(live, json.dumps(mutated, ensure_ascii=False, indent=2))
+                reparsed = json.loads(live.read_text(encoding="utf-8"))
+                self._sanity(key, _original, reparsed)
+            for (rel, _before, after), (_copy, live) in zip(
+                text_plans, restored[len(storage_plans):]
+            ):
+                self._atomic_write(live, after)
+        except Exception as exc:
+            self._rollback(restored)
+            self._journal_update(entry_id, status="rolled_back", error=str(exc))
+            await self._start_core()  # never raises
+            raise RuntimeError(
+                f"storage edit failed and was rolled back (undo {undo_id}): {exc}"
+            ) from exc
+
+        # 6. commit BEFORE core start — the mutation is done; anything after
+        # this is a post-step whose failure must not read as a failed apply
+        self._journal_update(entry_id, status="committed")
+
+        # 7. fire core start and return promptly (no boot poll in-path)
+        core_restart = await self._start_core()
+        return {
+            "applied": True,
+            "changed": diff,
+            "undo_id": undo_id,
+            "backup_slug": slug,
+            "journal_id": entry_id,
+            "core_restart": core_restart,
+        }
 
     # -- internals --------------------------------------------------------
     @staticmethod
@@ -243,19 +277,24 @@ class StorageEditor:
         for undo_copy, live in restored:
             shutil.copy2(undo_copy, live)
 
-    async def _wait_core_running(self) -> None:
-        deadline = time.monotonic() + self.start_timeout
-        last_state = "unknown"
-        while time.monotonic() < deadline:
-            try:
-                info = await self.ctx.supervisor.get("/core/info")
-                last_state = str((info.get("data") or {}).get("state", "unknown"))
-                if last_state.lower() == "running":
-                    return
-            except Exception:  # noqa: BLE001 — supervisor may 502 while core boots
-                last_state = "unreachable"
-            await self._sleep(self.poll_interval)
-        raise TimeoutError(f"core not RUNNING after {self.start_timeout}s (last state: {last_state})")
+    async def _start_core(self) -> str:
+        """Request core start without blocking on the boot. Never raises: the
+        mutation (if any) is already committed, so a start hiccup is reported
+        as structured status, not as an apply failure."""
+        try:
+            await self.ctx.supervisor.post("/core/start", timeout=self.start_post_timeout)
+            return "started"
+        except httpx.TimeoutException:
+            return (
+                "in_progress (start requested; core boot outlived the HTTP read "
+                "timeout — poll core status if you need confirmation)"
+            )
+        except Exception as exc:  # noqa: BLE001 — post-commit; report, don't fail
+            return f"start_failed: {exc} — POST /core/start via the Supervisor manually"
+
+    @staticmethod
+    def _journal_update(entry_id: str, **fields: Any) -> None:
+        StorageEditor._journal({"action": "journal_update", "ref": entry_id, **fields})
 
     @staticmethod
     def _journal(entry: dict[str, Any]) -> str:

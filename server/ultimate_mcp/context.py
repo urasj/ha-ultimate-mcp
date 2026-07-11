@@ -59,8 +59,17 @@ class SupervisorClient:
                 return r.text
         return r.text
 
-    async def post(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        r = await self._client.post(path, json=body or {})
+    async def post(
+        self, path: str, body: dict[str, Any] | None = None, timeout: float | None = None
+    ) -> dict[str, Any]:
+        """POST to a Supervisor endpoint. Pass `timeout` for calls whose
+        server-side work outlives the 30 s client default (backups) or that
+        should give up fast and be handled by the caller (core start)."""
+        r = await self._client.post(
+            path,
+            json=body or {},
+            timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+        )
         r.raise_for_status()
         return r.json() if r.content else {}
 

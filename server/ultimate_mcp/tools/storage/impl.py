@@ -339,6 +339,45 @@ def _apply_patch(doc: dict[str, Any], patch: list[dict[str, Any]]) -> dict[str, 
     return doc
 
 
+_MISSING = object()
+
+
+def _patch_already_applied(doc: dict[str, Any], patch: list[dict[str, Any]]) -> bool:
+    """True when every op's effect is already present in the document, so a
+    retried apply (agent re-sends after a lost response) can no-op instead of
+    failing (remove of a now-absent key) or double-applying."""
+    for op in patch:
+        kind = op.get("op")
+        path = op.get("path", "")
+        try:
+            parent, last = _pointer_walk(doc, path)
+        except (KeyError, ValueError, TypeError, IndexError):
+            if kind == "remove":
+                continue  # path (or its parents) already gone
+            return False
+        if kind == "remove":
+            if isinstance(parent, list):
+                return False  # list removals shift indexes; never assume applied
+            if last in parent:
+                return False
+        elif kind in ("add", "replace"):
+            value = op.get("value", _MISSING)
+            if isinstance(parent, list):
+                if last == "-":
+                    return False  # appends are legitimately repeatable
+                try:
+                    idx = int(last)
+                except ValueError:
+                    return False
+                if idx >= len(parent) or parent[idx] != value:
+                    return False
+            elif not isinstance(parent, dict) or parent.get(last, _MISSING) != value:
+                return False
+        else:
+            return False
+    return True
+
+
 async def storage_patch(
     ctx: Context,
     key: str,
@@ -348,6 +387,14 @@ async def storage_patch(
 ) -> dict[str, Any]:
     if not isinstance(json_patch, list) or not json_patch:
         raise ValueError("json_patch must be a non-empty list of {op, path[, value]}")
+
+    if not dry_run and _patch_already_applied(ctx.fs.read_storage(key), json_patch):
+        return {
+            "applied": True,
+            "no_op": True,
+            "key": key,
+            "note": "patch already reflected in the document; nothing was written",
+        }
 
     def mutate(data: dict[str, Any]) -> dict[str, Any]:
         return _apply_patch(copy.deepcopy(data), copy.deepcopy(json_patch))

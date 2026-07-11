@@ -159,3 +159,49 @@ def test_t1_never_needs_checkpoint_or_token(tmp_path, monkeypatch):
     kernel_mod, k = _kernel(tmp_path, monkeypatch)
     reg = _registry()
     run(k.authorize(reg, "t1_tool", False, None, None))
+
+
+# --------------------------------------------- 0.2.5 write-ahead journal
+
+def test_journal_open_update_fold(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    entry_id = k.journal_open("storage_edit", tool="storage_patch", undo_id="u-1")
+    tail = k.journal_tail(10)
+    entry = next(e for e in tail if e["id"] == entry_id)
+    assert entry["status"] == "pending"
+    assert entry["undo_id"] == "u-1"
+
+    k.journal_update(entry_id, status="committed", backup_slug="abc")
+    tail = k.journal_tail(10)
+    entry = next(e for e in tail if e["id"] == entry_id)
+    assert entry["status"] == "committed"
+    assert entry["backup_slug"] == "abc"
+    # raw update records are folded away, not surfaced as entries
+    assert not any(e.get("action") == "journal_update" for e in tail)
+
+
+def test_journal_find_folds_updates(tmp_path, monkeypatch):
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    entry_id = k.journal_open("fs_write_www", tool="fs_write_www")
+    k.journal_update(entry_id, status="committed", target="/x/y")
+    found = k._journal_find(entry_id)
+    assert found["status"] == "committed"
+    assert found["target"] == "/x/y"
+
+
+def test_undo_works_on_pending_entry(tmp_path, monkeypatch):
+    """A crash between write and commit leaves a pending entry; umcp_undo must
+    still be able to restore from its undo copy."""
+    kernel_mod, k = _kernel(tmp_path, monkeypatch)
+    target = tmp_path / "ha" / "file.json"
+    import json as _json
+    target.write_text(_json.dumps({"v": 1}), encoding="utf-8")
+    entry_id = k.journal_open("edit", tool="t")
+    k.attach_undo_artifact(entry_id, target, str(target))
+    target.write_text(_json.dumps({"v": 2}), encoding="utf-8")  # the "mutation"
+
+    result = run(k.undo(entry_id))
+    assert result["undoable"] is True, result
+    assert _json.loads(target.read_text())["v"] == 1
+    # entry was pending the whole time — never committed
+    assert k._journal_find(entry_id)["status"] == "pending"

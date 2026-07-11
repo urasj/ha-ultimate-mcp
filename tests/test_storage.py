@@ -135,13 +135,13 @@ class StubSupervisor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
-    async def get(self, path: str) -> dict:
+    async def get(self, path: str, **_kw) -> dict:
         self.calls.append(("GET", path))
         if path == "/core/info":
             return {"result": "ok", "data": {"state": "running"}}
         return {"result": "ok", "data": {}}
 
-    async def post(self, path: str, body: dict | None = None) -> dict:
+    async def post(self, path: str, body: dict | None = None, **_kw) -> dict:
         self.calls.append(("POST", path))
         if path == "/backups/new/partial":
             return {"result": "ok", "data": {"slug": "aa11bb22"}}
@@ -228,18 +228,27 @@ def test_editor_execute_call_order_and_journal(ctx):
 
     ed = StorageEditor(ctx)
     out = asyncio.run(ed.edit("core.config_entries", mutate, dry_run=False))
-    # protocol order: backup -> stop -> start
+    # protocol order: backup -> stop -> start; no boot poll in the request path
     assert ctx.supervisor.posts() == ["/backups/new/partial", "/core/stop", "/core/start"]
-    assert ("GET", "/core/info") in ctx.supervisor.calls
+    assert ("GET", "/core/info") not in ctx.supervisor.calls
+    assert out["applied"] is True
     assert out["backup_slug"] == "aa11bb22"
+    assert out["core_restart"] == "started"
     assert ctx.fs.read_storage("core.config_entries")["data"]["entries"][0]["title"] == "Hue Bridge"
     # undo copy exists and holds the ORIGINAL content
     undo = Path(os.environ["UMCP_DATA"]) / "undo" / out["undo_id"] / ".storage__core.config_entries"
     assert json.loads(undo.read_text())["data"]["entries"][0]["title"] == "Philips Hue"
-    # journal recorded it
-    last = json.loads(JOURNAL.read_text().strip().splitlines()[-1])
-    assert last["action"] == "storage_edit"
-    assert last["undo_id"] == out["undo_id"]
+    # write-ahead journal: pending base entry + a committed update record
+    lines = [json.loads(ln) for ln in JOURNAL.read_text().strip().splitlines()]
+    entry = next(e for e in lines if e.get("action") == "storage_edit" and e["id"] == out["journal_id"])
+    assert entry["status"] == "pending"  # as originally appended, pre-write
+    assert entry["undo_id"] == out["undo_id"]
+    assert any(
+        e.get("action") == "journal_update"
+        and e.get("ref") == out["journal_id"]
+        and e.get("status") == "committed"
+        for e in lines
+    )
 
 
 def test_editor_sanity_guard_blocks_envelope_damage(ctx):

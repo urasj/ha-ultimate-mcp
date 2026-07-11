@@ -166,6 +166,12 @@ class SafetyKernel:
         }
 
     # ------------------------------------------------------------ journal
+    # The journal is append-only JSONL. 0.2.5 adds write-ahead semantics:
+    # a mutation FIRST appends a base entry with status "pending", then later
+    # appends {"action": "journal_update", "ref": <id>, ...} records that are
+    # folded into the base entry on read (status "committed" / "failed" / ...).
+    # Append-only means a crash mid-flight always leaves the pending record.
+
     def _journal(self, entry: dict[str, Any]) -> str:
         entry = {"id": secrets.token_hex(6), "ts": time.time(), **entry}
         JOURNAL.parent.mkdir(parents=True, exist_ok=True)
@@ -173,17 +179,49 @@ class SafetyKernel:
             f.write(json.dumps(entry, default=str) + "\n")
         return entry["id"]
 
-    def journal_tail(self, limit: int = 20) -> list[dict[str, Any]]:
+    def journal_open(self, action: str, **meta: Any) -> str:
+        """Append a write-ahead entry (status pending) BEFORE mutating."""
+        return self._journal({"action": action, "status": "pending", **meta})
+
+    def journal_update(self, entry_id: str, **fields: Any) -> None:
+        """Append an update record for an existing entry (folded on read)."""
+        self._journal({"action": "journal_update", "ref": entry_id, **fields})
+
+    def attach_undo_artifact(
+        self, entry_id: str, src_path: str | os.PathLike, target: str
+    ) -> None:
+        """Copy a pre-change file into this entry's undo dir and record it."""
+        src = Path(src_path)
+        dest_dir = UNDO_DIR / entry_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        shutil.copy2(src, dest)
+        self.journal_update(entry_id, undo_artifact=str(dest), target=target)
+
+    def _read_entries(self) -> list[dict[str, Any]]:
+        """All journal entries with journal_update records folded in."""
         if not JOURNAL.exists():
             return []
-        lines = JOURNAL.read_text(encoding="utf-8").strip().splitlines()
-        return [json.loads(ln) for ln in lines[-limit:]]
-
-    def _journal_find(self, entry_id: str) -> dict[str, Any] | None:
-        if not JOURNAL.exists():
-            return None
+        base: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
         for ln in JOURNAL.read_text(encoding="utf-8").strip().splitlines():
             entry = json.loads(ln)
+            if entry.get("action") == "journal_update" and entry.get("ref"):
+                target = base.get(entry["ref"])
+                if target is not None:
+                    target.update(
+                        {k: v for k, v in entry.items() if k not in ("id", "ts", "action", "ref")}
+                    )
+                continue
+            base[entry["id"]] = entry
+            order.append(entry["id"])
+        return [base[i] for i in order]
+
+    def journal_tail(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self._read_entries()[-limit:]
+
+    def _journal_find(self, entry_id: str) -> dict[str, Any] | None:
+        for entry in self._read_entries():
             if entry.get("id") == entry_id:
                 return entry
         return None
@@ -226,6 +264,14 @@ class SafetyKernel:
         entry = self._journal_find(entry_id)
         if entry is None:
             return {"undoable": False, "reason": f"no journal entry with id {entry_id!r}"}
+        if entry.get("status") == "superseded":
+            return {
+                "undoable": False,
+                "reason": (
+                    f"entry {entry_id!r} was superseded by journal entry "
+                    f"{entry.get('superseded_by')!r} — undo that entry instead"
+                ),
+            }
         artifact = entry.get("undo_artifact")
         if not artifact:
             if entry.get("undo_id") and entry.get("files"):

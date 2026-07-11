@@ -56,22 +56,32 @@ def run(coro):
 
 
 class StubSupervisor:
-    """Records every REST interaction; answers /core/info with RUNNING."""
+    """Records every REST interaction; answers /core/info with RUNNING.
 
-    def __init__(self) -> None:
+    Set fail_start to make POST /core/start raise like production does when
+    core's boot outlives the HTTP read timeout.
+    """
+
+    def __init__(self, fail_start: Exception | None = None) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.fail_start = fail_start
 
-    async def get(self, path: str) -> dict:
+    async def get(self, path: str, **_kw) -> dict:
         self.calls.append(("GET", path))
         if path == "/core/info":
             return {"result": "ok", "data": {"state": "running"}}
         return {"result": "ok", "data": {}}
 
-    async def post(self, path: str, body: dict | None = None) -> dict:
+    async def post(self, path: str, body: dict | None = None, **_kw) -> dict:
         self.calls.append(("POST", path))
+        if path == "/core/start" and self.fail_start is not None:
+            raise self.fail_start
         if path == "/backups/new/partial":
             return {"result": "ok", "data": {"slug": "cafe0001"}}
         return {"result": "ok", "data": {}}
+
+    def posts(self) -> list[str]:
+        return [p for verb, p in self.calls if verb == "POST"]
 
 
 class StubWs:
@@ -303,6 +313,99 @@ def test_t3_disabled_master_switch(tmp_path):
     with pytest.raises(PermissionError, match="destructive_enabled"):
         call(ctx, registry, safety, "stats_clear",
              {"statistic_ids": ["sensor.a"]}, dry_run=False, confirm_token="whatever")
+
+
+# ------------------------------------------- 0.2.5: atomic apply (journal-first)
+
+def test_t2_apply_core_start_timeout_still_applied_and_journaled(harness):
+    """Production repro: core boot outlives the httpx read timeout on
+    POST /core/start. The mutation is on disk — the response must say so,
+    the journal entry (with undo copy) must exist, and undo must work."""
+    import httpx
+
+    ctx, registry, safety = harness
+    ctx.supervisor.fail_start = httpx.ReadTimeout("core boot outlived read timeout")
+    run(safety.checkpoint("homeassistant", "test"))
+
+    out = call(ctx, registry, safety, "storage_patch", dict(PATCH_ARGS), dry_run=False)
+
+    assert out.get("applied") is True, f"applied mutation reported as failure: {out}"
+    assert "in_progress" in str(out.get("core_restart", "")), out
+    assert out.get("journal_id"), out
+    # mutation really landed
+    doc = ctx.fs.read_storage("core.config_entries")
+    assert doc["data"]["entries"][0]["title"] == "Renamed Hue"
+    # journaled (write-ahead entry, committed after the write) incl. undo info
+    entry = next(e for e in safety.journal_tail(30) if e["id"] == out["journal_id"])
+    assert entry.get("status") == "committed", entry
+    assert entry.get("undo_id"), entry
+    # the slow core boot must NOT have rolled the write back or double-started
+    assert ctx.supervisor.posts().count("/core/start") == 1
+    # undo reverses the change even though core restart was unconfirmed
+    undo = run(safety.undo(out["journal_id"]))
+    assert undo["undoable"] is True, undo
+    doc = ctx.fs.read_storage("core.config_entries")
+    assert doc["data"]["entries"][0]["title"] == "Philips Hue"
+
+
+def test_t2_apply_returns_promptly_without_boot_poll(harness):
+    """Requirement #6: the apply must not block on core's full boot — no
+    /core/info wait-poll in the request path (prod proxy dies at 90 s)."""
+    ctx, registry, safety = harness
+    run(safety.checkpoint("homeassistant", "test"))
+    out = call(ctx, registry, safety, "storage_patch", dict(PATCH_ARGS), dry_run=False)
+    assert out.get("applied") is True
+    assert ("GET", "/core/info") not in ctx.supervisor.calls
+
+
+def test_t2_storage_patch_reapply_replace_is_noop(harness):
+    ctx, registry, safety = harness
+    run(safety.checkpoint("homeassistant", "test"))
+    call(ctx, registry, safety, "storage_patch", dict(PATCH_ARGS), dry_run=False)
+    stops_after_first = ctx.supervisor.posts().count("/core/stop")
+
+    again = call(ctx, registry, safety, "storage_patch", dict(PATCH_ARGS), dry_run=False)
+    assert again.get("applied") is True, again
+    assert again.get("no_op") is True, again
+    # no second stop/backup cycle for a no-op
+    assert ctx.supervisor.posts().count("/core/stop") == stops_after_first
+    doc = ctx.fs.read_storage("core.config_entries")
+    assert doc["data"]["entries"][0]["title"] == "Renamed Hue"
+
+
+def test_t2_storage_patch_remove_retry_is_noop(harness):
+    """The wild scenario: agent retries an apply whose response died. For a
+    'remove' op the second pass must see 'already reflected', not KeyError."""
+    ctx, registry, safety = harness
+    run(safety.checkpoint("homeassistant", "test"))
+    rm = {"key": "core.config_entries",
+          "json_patch": [{"op": "remove", "path": "/data/entries/0/domain"}]}
+    first = call(ctx, registry, safety, "storage_patch", dict(rm), dry_run=False)
+    assert "domain" not in ctx.fs.read_storage("core.config_entries")["data"]["entries"][0]
+    assert first.get("no_op") is not True
+
+    again = call(ctx, registry, safety, "storage_patch", dict(rm), dry_run=False)
+    assert again.get("applied") is True, again
+    assert again.get("no_op") is True, again
+
+
+def test_t3_ws_failure_leaves_non_committed_journal_entry(t3_harness):
+    """Journal-first for non-storage paths too: if the WS call degrades to an
+    error, the write-ahead entry must not read as a committed mutation."""
+    ctx, registry, safety = t3_harness
+
+    async def boom(command, **kwargs):
+        raise RuntimeError("ws connection lost")
+
+    ctx.ha_ws.call = boom
+    args = {"statistic_ids": ["sensor.dead_1"]}
+    dry = call(ctx, registry, safety, "stats_clear", args)
+    out = call(ctx, registry, safety, "stats_clear", args, dry_run=False,
+               confirm_token=dry["confirm_token"])
+    assert out.get("executed") is False  # impl degrades, does not raise
+    assert out.get("journal_id"), out
+    entry = next(e for e in safety.journal_tail(30) if e["id"] == out["journal_id"])
+    assert entry.get("status") == "failed", entry
 
 
 # ------------------------------------------------- regression: T0 untouched

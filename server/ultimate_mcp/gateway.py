@@ -8,14 +8,16 @@ This layer owns everything between the MCP tool boundary and Registry.dispatch:
     re-ran their dry-run branch on apply and T2/T3 could never execute)
   * on T2+/T3 dry-runs, annotates the plan with exactly what the apply needs:
     live checkpoint status, and a freshly minted confirm_token for T3
-  * journals every successful T1+ apply (with an undo artifact when the tool
-    exposes one) so umcp_journal / umcp_undo cover the whole mutation surface
+  * write-ahead journals every T1+ apply (0.2.5): a pending entry is appended
+    BEFORE dispatch and resolved to committed / failed / no_op / superseded
+    after, with an undo artifact attached when the tool exposes one — so
+    umcp_journal / umcp_undo cover the whole mutation surface even when a
+    dispatch dies mid-flight
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from ultimate_mcp.context import DATA_DIR, Context
@@ -60,56 +62,63 @@ def _annotate_dry_run(
     return result
 
 
-def _journal_apply(
+def _finalize_apply(
     ctx: Context,
     safety: SafetyKernel,
     name: str,
+    pending_id: str,
     external_checkpoint_ref: str | None,
     result: Any,
 ) -> Any:
-    """Journal a successful apply so umcp_undo can replay the inverse.
+    """Resolve the write-ahead entry after a dispatch that returned.
 
-    Tools that route through StorageEditor already journal themselves (they
-    return a journal_id); for those we only add the external-ref record. For
-    everything else we journal here, attaching the tool's own pre-change undo
-    copy (undo_id + path, the _guarded_write convention) when it exposes one.
+    Tools that route through StorageEditor journal themselves write-ahead (the
+    result carries their journal_id) — our gateway entry is then superseded.
+    For everything else the gateway entry IS the record: mark it committed /
+    failed / no_op, attaching the tool's pre-change undo copy (undo_id + path,
+    the _guarded_write convention) when it exposes one.
     """
-    if not isinstance(result, dict) or "error" in result:
+    if not isinstance(result, dict):
+        safety.journal_update(pending_id, status="committed", result=str(result)[:200])
         return result
-    if result.get("journal_id"):
+
+    if result.get("journal_id") and result["journal_id"] != pending_id:
+        safety.journal_update(
+            pending_id, status="superseded", superseded_by=result["journal_id"]
+        )
         if external_checkpoint_ref:
-            safety._journal(
-                {
-                    "action": "external_checkpoint_ref",
-                    "tool": name,
-                    "external_checkpoint_ref": external_checkpoint_ref,
-                    "linked_journal_id": result["journal_id"],
-                }
+            safety.journal_update(
+                result["journal_id"], external_checkpoint_ref=external_checkpoint_ref
             )
         return result
 
-    meta: dict[str, Any] = {"tool": name}
-    if external_checkpoint_ref:
-        meta["external_checkpoint_ref"] = external_checkpoint_ref
-    if result.get("undo_id"):
-        meta["undo_id"] = result["undo_id"]
+    result["journal_id"] = pending_id
+    if result.get("error") or result.get("executed") is False:
+        safety.journal_update(
+            pending_id,
+            status="failed",
+            error=str(result.get("error") or result.get("result") or "executed=false")[:300],
+        )
+        return result
+    if result.get("no_op"):
+        safety.journal_update(pending_id, status="no_op")
+        return result
 
-    target = ""
-    undo_artifact: Path | None = None
+    updates: dict[str, Any] = {"status": "committed"}
+    if result.get("undo_id"):
+        updates["undo_id"] = result["undo_id"]
     rel = result.get("path")
     if isinstance(rel, str) and rel:
         try:
             target = str(ctx.fs.resolve(rel))
         except Exception:  # noqa: BLE001 — journaling must never fail an apply
             target = rel
+        updates["target"] = target
         if result.get("undo_id"):
             candidate = UNDO_ROOT / str(result["undo_id"]) / rel.replace("/", "__")
             if candidate.exists():
-                undo_artifact = candidate
-
-    result["journal_id"] = safety.record(
-        name, target, undo_artifact_path=undo_artifact, **meta
-    )
+                safety.attach_undo_artifact(pending_id, candidate, target)
+    safety.journal_update(pending_id, **updates)
     return result
 
 
@@ -129,15 +138,29 @@ async def call_tool(
         registry, name, dry_run, confirm_token, external_checkpoint_ref, args_hash=args_hash
     )
     args["dry_run"] = dry_run  # the caller's flag always wins over impl defaults
-    result = await registry.dispatch(ctx, name, args)
-
     tier = registry.tools[name].spec.tier
-    if dry_run:
-        if tier >= Tier.T2_RISKY:
+
+    if dry_run or tier < Tier.T1_REVERSIBLE:
+        result = await registry.dispatch(ctx, name, args)
+        if dry_run and tier >= Tier.T2_RISKY:
             result = _annotate_dry_run(
                 safety, name, tier, args_hash, external_checkpoint_ref, result
             )
         return result
-    if tier >= Tier.T1_REVERSIBLE:
-        result = _journal_apply(ctx, safety, name, external_checkpoint_ref, result)
-    return result
+
+    # T1+ apply: write-ahead journal entry BEFORE the mutation, for every
+    # mutating path — a crash mid-dispatch must leave a discoverable record.
+    meta: dict[str, Any] = {"tool": name, "args_hash": args_hash}
+    if external_checkpoint_ref:
+        meta["external_checkpoint_ref"] = external_checkpoint_ref
+    pending_id = safety.journal_open(name, **meta)
+    try:
+        result = await registry.dispatch(ctx, name, args)
+    except Exception as exc:
+        safety.journal_update(pending_id, status="unknown", error=str(exc))
+        raise RuntimeError(
+            f"{name} apply raised {exc!r} — mutation state UNKNOWN. Write-ahead "
+            f"journal entry {pending_id} recorded (status unknown); inspect state "
+            f"with a read tool / umcp_journal before retrying."
+        ) from exc
+    return _finalize_apply(ctx, safety, name, pending_id, external_checkpoint_ref, result)

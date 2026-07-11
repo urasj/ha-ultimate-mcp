@@ -83,7 +83,7 @@ class StubSupervisor:
             return {"data": {"state": "running"}}
         return {"data": {}}
 
-    async def post(self, path, body=None):
+    async def post(self, path, body=None, **_kw):
         self.calls.append(("POST", path))
         if path == "/backups/new/partial":
             return {"data": {"slug": "slug1"}}

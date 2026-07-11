@@ -82,7 +82,10 @@ async def umcp_checkpoint(scope: str = "homeassistant", name_hint: str = "manual
 
 @mcp.tool()
 async def umcp_journal(limit: int = 20) -> list[dict[str, Any]]:
-    """Recent change-journal entries (every mutation is recorded)."""
+    """Recent change-journal entries. Every T1+ apply is journaled write-ahead:
+    `status` is pending while in flight, then committed / failed / no_op /
+    rolled_back / superseded / unknown. A pending entry after an error means
+    the mutation may have landed — inspect state before retrying."""
     return _safety.journal_tail(limit)
 
 
