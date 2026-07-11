@@ -1,11 +1,15 @@
-"""Safety kernel — tier enforcement, checkpoints, confirm tokens, undo journal (W0).
+"""Safety kernel — tier enforcement, checkpoints, confirm tokens, undo journal.
 
-Full storage_editor (stop→backup→atomic-edit→validate→start) lands in W2 and
-routes through this kernel.
+0.2.4: the gate state is no longer write-only. Checkpoints register with a
+timestamp and are honored within a TTL; T3 confirm tokens are minted by the
+gateway on dry-run, bound to (tool, canonical args hash), single-use, and
+TTL-limited, with distinct rejection reasons (token_missing / token_unknown /
+token_expired / token_args_mismatch).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -20,13 +24,68 @@ from ultimate_mcp.spec import Tier
 JOURNAL = DATA_DIR / "journal.jsonl"
 UNDO_DIR = DATA_DIR / "undo"
 
+TOKEN_TTL_SECONDS = 900  # 15 min — a confirm_token must be used within this window
+CHECKPOINT_TTL_SECONDS_DEFAULT = 1800  # 30 min; override with checkpoint_ttl_seconds option
+
+
+def canonical_args_hash(args: dict[str, Any] | None) -> str:
+    """Order-independent hash of the tool args, ignoring the dry_run flag
+    (the dry-run and apply calls differ only in that flag)."""
+    basis = {k: v for k, v in (args or {}).items() if k != "dry_run"}
+    encoded = json.dumps(basis, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
 
 class SafetyKernel:
     def __init__(self, ctx: Context) -> None:
         self.ctx = ctx
-        self._pending_tokens: dict[str, str] = {}  # token -> tool name
-        self._session_checkpoints: list[str] = []
+        # token -> {"tool": name, "args_hash": hash, "expires_at": epoch}
+        self._pending_tokens: dict[str, dict[str, Any]] = {}
+        # {"checkpoint_id": slug, "created_at": epoch, "scope": scope}
+        # Process-wide (the kernel is a module-level singleton in app.py), NOT
+        # per-MCP-session: streamable-HTTP clients routinely re-initialize
+        # sessions between the checkpoint call and the apply.
+        self._checkpoints: list[dict[str, Any]] = []
 
+    # ------------------------------------------------------------ gate state
+    @property
+    def checkpoint_ttl(self) -> float:
+        return float(self.ctx.options.get("checkpoint_ttl_seconds", CHECKPOINT_TTL_SECONDS_DEFAULT))
+
+    def _live_checkpoints(self) -> list[dict[str, Any]]:
+        now = time.time()
+        ttl = self.checkpoint_ttl
+        return [c for c in self._checkpoints if now - c["created_at"] <= ttl]
+
+    def checkpoint_remediation(self) -> str:
+        return (
+            "checkpoint_required: no live checkpoint (TTL "
+            f"{int(self.checkpoint_ttl)}s). Either call umcp_checkpoint to create a "
+            "Supervisor partial backup, or pass external_checkpoint_ref with your own "
+            "checkpoint reference (e.g. a Proxmox snapshot name of the HA VM)."
+        )
+
+    def checkpoint_status(self, external_checkpoint_ref: str | None = None) -> dict[str, Any]:
+        """Gate-visible checkpoint state, embedded in T2+/T3 dry-run responses."""
+        if external_checkpoint_ref:
+            return {"satisfied": True, "source": "external", "ref": external_checkpoint_ref}
+        live = self._live_checkpoints()
+        if live:
+            latest = max(live, key=lambda c: c["created_at"])
+            return {
+                "satisfied": True,
+                "source": "umcp_checkpoint",
+                "checkpoint_id": latest["checkpoint_id"],
+                "age_seconds": round(time.time() - latest["created_at"], 1),
+                "ttl_seconds": int(self.checkpoint_ttl),
+            }
+        return {
+            "satisfied": False,
+            "ttl_seconds": int(self.checkpoint_ttl),
+            "remediation": self.checkpoint_remediation(),
+        }
+
+    # ------------------------------------------------------------ authorize
     async def authorize(
         self,
         registry: Any,
@@ -34,6 +93,7 @@ class SafetyKernel:
         dry_run: bool,
         confirm_token: str | None,
         external_checkpoint_ref: str | None,
+        args_hash: str | None = None,
     ) -> None:
         rt = registry.tools.get(name)
         if rt is None:
@@ -41,33 +101,71 @@ class SafetyKernel:
         tier = rt.spec.tier
         if tier == Tier.T0_READ or dry_run:
             return
-        if tier >= Tier.T2_RISKY and not self._session_checkpoints and not external_checkpoint_ref:
-            raise PermissionError(
-                "T2+ tool requires a checkpoint first: call umcp_checkpoint "
-                "(or pass external_checkpoint_ref, e.g. a Proxmox snapshot of vmid 100)"
-            )
+        if tier == Tier.T3_DESTRUCTIVE and not self.ctx.options.get("destructive_enabled", False):
+            raise PermissionError("T3 disabled: set destructive_enabled: true in add-on options")
+        if tier >= Tier.T2_RISKY and not external_checkpoint_ref and not self._live_checkpoints():
+            raise PermissionError(self.checkpoint_remediation())
         if tier == Tier.T3_DESTRUCTIVE:
-            if not self.ctx.options.get("destructive_enabled", False):
-                raise PermissionError("T3 disabled: set destructive_enabled: true in add-on options")
-            if not confirm_token or self._pending_tokens.pop(confirm_token, None) != name:
-                raise PermissionError(
-                    "T3 requires confirm_token from this tool's dry-run response"
-                )
+            self._consume_token(name, confirm_token, args_hash)
 
-    def mint_token(self, tool_name: str) -> str:
+    def _consume_token(self, name: str, token: str | None, args_hash: str | None) -> None:
+        if not token:
+            raise PermissionError(
+                "token_missing: T3 requires the confirm_token from this tool's dry-run "
+                "response — call again with dry_run=true first"
+            )
+        info = self._pending_tokens.get(token)
+        if info is None:
+            raise PermissionError(
+                "token_unknown: confirm_token not recognized (already used, or minted "
+                "before a server restart) — re-run dry_run=true for a fresh token"
+            )
+        if time.time() > info["expires_at"]:
+            del self._pending_tokens[token]
+            raise PermissionError(
+                f"token_expired: confirm_token outlived its {TOKEN_TTL_SECONDS}s TTL — "
+                "re-run dry_run=true for a fresh token"
+            )
+        if info["tool"] != name or (args_hash is not None and info["args_hash"] != args_hash):
+            # NOT consumed: the caller may retry with the args the token was minted for
+            raise PermissionError(
+                "token_args_mismatch: confirm_token was minted for a different tool or "
+                "args — re-run with exactly the dry-run's name/args, or dry-run again"
+            )
+        del self._pending_tokens[token]  # single-use
+
+    def mint_token(self, tool_name: str, args_hash: str) -> str:
+        now = time.time()
+        # opportunistic prune so abandoned dry-runs don't accumulate
+        self._pending_tokens = {
+            t: i for t, i in self._pending_tokens.items() if i["expires_at"] >= now
+        }
         token = secrets.token_urlsafe(12)
-        self._pending_tokens[token] = tool_name
+        self._pending_tokens[token] = {
+            "tool": tool_name,
+            "args_hash": args_hash,
+            "expires_at": now + TOKEN_TTL_SECONDS,
+        }
         return token
 
+    # ------------------------------------------------------------ checkpoint
     async def checkpoint(self, scope: str, name_hint: str) -> dict[str, Any]:
         body = {"name": f"umcp-{name_hint}-{int(time.time())}", "homeassistant": scope != "addons"}
         resp = await self.ctx.supervisor.post("/backups/new/partial", body)
         slug = (resp.get("data") or {}).get("slug", "")
         if slug:
-            self._session_checkpoints.append(slug)
+            self._checkpoints.append(
+                {"checkpoint_id": slug, "created_at": time.time(), "scope": scope}
+            )
             self._journal({"action": "checkpoint", "slug": slug, "scope": scope})
-        return {"slug": slug, "scope": scope}
+        return {
+            "slug": slug,
+            "scope": scope,
+            "registered": bool(slug),
+            "ttl_seconds": int(self.checkpoint_ttl),
+        }
 
+    # ------------------------------------------------------------ journal
     def _journal(self, entry: dict[str, Any]) -> str:
         entry = {"id": secrets.token_hex(6), "ts": time.time(), **entry}
         JOURNAL.parent.mkdir(parents=True, exist_ok=True)
@@ -116,17 +214,22 @@ class SafetyKernel:
         self._journal(entry)
         return entry_id
 
+    # ------------------------------------------------------------ undo
     async def undo(self, entry_id: str) -> dict[str, Any]:
-        """Restore the pre-change artifact for a journaled entry (atomic os.replace).
+        """Restore the pre-change artifact(s) for a journaled entry.
 
-        Entries recorded without an undo artifact (service calls, checkpoints, …)
-        are reported as not undoable rather than raising.
+        Handles both single-artifact entries (record()) and StorageEditor
+        entries, which carry undo_id + files instead of one undo_artifact.
+        Entries with neither (service calls, checkpoints, …) are reported as
+        not undoable rather than raising.
         """
         entry = self._journal_find(entry_id)
         if entry is None:
             return {"undoable": False, "reason": f"no journal entry with id {entry_id!r}"}
         artifact = entry.get("undo_artifact")
         if not artifact:
+            if entry.get("undo_id") and entry.get("files"):
+                return await self._undo_fileset(entry_id, entry)
             return {
                 "undoable": False,
                 "reason": f"entry {entry_id!r} ({entry.get('action')}) has no undo artifact",
@@ -137,6 +240,44 @@ class SafetyKernel:
         target = Path(str(entry.get("target", "")))
         if not str(target):
             return {"undoable": False, "reason": f"entry {entry_id!r} has no restore target"}
+        self._restore(artifact_path, target)
+        undo_journal_id = self._journal(
+            {"action": "undo", "target": str(target), "undid": entry_id}
+        )
+        return {
+            "undoable": True,
+            "restored": str(target),
+            "entry_id": entry_id,
+            "journal_id": undo_journal_id,
+        }
+
+    async def _undo_fileset(self, entry_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+        """Undo a StorageEditor entry: restore every file from its undo dir."""
+        fs = getattr(self.ctx, "fs", None)
+        if fs is None:
+            return {"undoable": False, "reason": "no filesystem facade available for undo"}
+        undo_dir = UNDO_DIR / str(entry["undo_id"])
+        restored: list[str] = []
+        for rel in entry["files"]:
+            undo_copy = undo_dir / str(rel).replace("/", "__")
+            if not undo_copy.exists():
+                return {"undoable": False, "reason": f"undo artifact missing: {undo_copy}"}
+            live = fs.resolve(str(rel))
+            self._restore(undo_copy, live)
+            restored.append(str(live))
+        undo_journal_id = self._journal(
+            {"action": "undo", "target": restored, "undid": entry_id}
+        )
+        return {
+            "undoable": True,
+            "restored": restored,
+            "entry_id": entry_id,
+            "journal_id": undo_journal_id,
+            "note": "restart HA core if these were .storage files (core caches them in memory)",
+        }
+
+    @staticmethod
+    def _restore(artifact_path: Path, target: Path) -> None:
         # /data and the target mount may be different filesystems, so a direct
         # os.replace(artifact, target) could fail with EXDEV. Copy the artifact
         # to a temp file NEXT TO the target, then os.replace — still atomic.
@@ -148,12 +289,3 @@ class SafetyKernel:
         finally:
             if tmp.exists():  # only on failure between copy and replace
                 tmp.unlink(missing_ok=True)
-        undo_journal_id = self._journal(
-            {"action": "undo", "target": str(target), "undid": entry_id}
-        )
-        return {
-            "undoable": True,
-            "restored": str(target),
-            "entry_id": entry_id,
-            "journal_id": undo_journal_id,
-        }

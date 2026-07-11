@@ -15,7 +15,7 @@ from typing import Any
 class Tier(IntEnum):
     T0_READ = 0          # no side effects
     T1_REVERSIBLE = 1    # reversible write; requires explicit dry_run=false
-    T2_RISKY = 2         # requires same-session checkpoint + dry-run preview
+    T2_RISKY = 2         # requires a live checkpoint (process-wide registry, TTL'd)
     T3_DESTRUCTIVE = 3   # requires destructive_enabled + confirm_token + checkpoint
 
 

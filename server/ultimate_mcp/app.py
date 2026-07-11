@@ -7,7 +7,6 @@ Transport: streamable HTTP on 0.0.0.0:8099/mcp, bearer-token gated.
 from __future__ import annotations
 
 import hmac
-import json
 import logging
 import os
 from typing import Any
@@ -16,6 +15,7 @@ from fastmcp import FastMCP
 
 from ultimate_mcp.context import Context
 from ultimate_mcp.fingerprint.collect import collect_fingerprint
+from ultimate_mcp.gateway import call_tool
 from ultimate_mcp.registry import Registry
 from ultimate_mcp.safety.kernel import SafetyKernel
 
@@ -59,19 +59,19 @@ async def umcp_call(
     external_checkpoint_ref: str | None = None,
 ) -> Any:
     """Invoke a virtual tool. Mutating tools default to dry_run=True and return a
-    plan + confirm_token; call again with dry_run=False (+ token for T3)."""
-    # Some MCP client bridges serialize the nested `args` object into a JSON
-    # string before it reaches us — coerce it back so parameterized tools work.
-    if isinstance(args, str):
-        s = args.strip()
-        args = json.loads(s) if s else {}
-    args = args or {}
-    if not isinstance(args, dict):
-        raise ValueError(f"args must be an object, got {type(args).__name__}")
-    await _safety.authorize(_registry, name, dry_run, confirm_token, external_checkpoint_ref)
-    if dry_run:
-        args["dry_run"] = True
-    return await _registry.dispatch(_ctx, name, args)
+    plan (T3 dry-runs include a single-use confirm_token); call again with
+    dry_run=False (+ confirm_token for T3, and a live umcp_checkpoint or
+    external_checkpoint_ref for T2+)."""
+    return await call_tool(
+        _ctx,
+        _registry,
+        _safety,
+        name,
+        args=args,
+        dry_run=dry_run,
+        confirm_token=confirm_token,
+        external_checkpoint_ref=external_checkpoint_ref,
+    )
 
 
 @mcp.tool()
