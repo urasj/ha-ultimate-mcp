@@ -61,6 +61,12 @@ jobs:
         arch: [amd64, aarch64]
     steps:
       - uses: actions/checkout@v4
+      - name: Stage server package into add-on build context
+        # builder builds with ultimate-mcp/ as the docker context, but the
+        # Python package lives at the repo root — copy it in first.
+        run: |
+          rm -rf ultimate-mcp/server
+          cp -r server ultimate-mcp/server
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:

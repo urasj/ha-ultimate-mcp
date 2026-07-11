@@ -4,3 +4,5 @@ __pycache__/
 .ruff_cache/
 .venv/
 *.egg-info/
+# staged by .github/workflows/builder.yaml; never commit
+ultimate-mcp/server/
