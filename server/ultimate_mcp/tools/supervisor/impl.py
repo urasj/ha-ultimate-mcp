@@ -56,16 +56,12 @@ async def addon_stats(ctx: Context, slug: str, **_: Any) -> Any:
 
 
 async def addon_logs(ctx: Context, slug: str, tail: int = 100, **_: Any) -> dict[str, Any]:
-    # UNSURE: Supervisor /addons/<slug>/logs returns text/plain, but ctx.supervisor.get
-    # decodes JSON only. If it raises, degrade gracefully rather than crash.
+    # /addons/<slug>/logs returns text/plain; ctx.supervisor.get decodes by
+    # content-type since 0.2.4, so a str comes back on the happy path.
     try:
         resp = await ctx.supervisor.get(f"/addons/{slug}/logs")
     except Exception as exc:  # noqa: BLE001
-        return {
-            "slug": slug,
-            "error": f"could not fetch logs: {exc}",
-            "note": "Supervisor logs endpoint returns text/plain; ctx.supervisor.get decodes JSON only",
-        }
+        return {"slug": slug, "error": f"could not fetch logs: {exc}"}
     if isinstance(resp, str):
         text = resp
     elif isinstance(resp, dict):

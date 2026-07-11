@@ -43,10 +43,21 @@ class SupervisorClient:
             timeout=30.0,
         )
 
-    async def get(self, path: str) -> dict[str, Any]:
+    async def get(self, path: str) -> Any:
+        """GET a Supervisor endpoint. Most return JSON, but the log endpoints
+        (/addons/<slug>/logs, /core/logs, …) return text/plain — decode by
+        content-type instead of assuming JSON."""
         r = await self._client.get(path)
         r.raise_for_status()
-        return r.json()
+        content_type = r.headers.get("content-type", "")
+        if "json" in content_type:
+            return r.json()
+        if not content_type:
+            try:
+                return r.json()
+            except ValueError:
+                return r.text
+        return r.text
 
     async def post(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         r = await self._client.post(path, json=body or {})

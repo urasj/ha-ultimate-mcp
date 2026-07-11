@@ -4,4 +4,7 @@
 # ==============================================================================
 bashio::log.info "Starting Ultimate MCP server..."
 export UMCP_LOG_LEVEL="$(bashio::config 'log_level')"
+if bashio::config.has_value 'go2rtc_url'; then
+    export UMCP_GO2RTC_URL="$(bashio::config 'go2rtc_url')"
+fi
 exec python3 -m ultimate_mcp
