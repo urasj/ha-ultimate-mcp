@@ -1,5 +1,5 @@
 name: "Ultimate MCP"
-version: "0.2.3"
+version: "0.2.4"
 slug: "ultimate_mcp"
 description: "Deep system-level MCP server: Supervisor, filesystem, recorder DB, MQTT/ZHA internals, diagnostics"
 url: "https://github.com/urasj/ha-ultimate-mcp"
@@ -57,3 +57,5 @@ schema:
   enabled_surfaces:
     - str
   destructive_enabled: bool
+  checkpoint_ttl_seconds: "int(60,86400)?"
+  go2rtc_url: "url?"
