@@ -68,7 +68,10 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push ${{ matrix.arch }} image
-        uses: home-assistant/builder@2026.06.0
+        # 2024.08.2 is the newest release with a published builder image;
+        # later action tags (2026.x) pull ghcr.io/home-assistant/{arch}-builder:<tag>
+        # images that don't exist and fail with "manifest unknown".
+        uses: home-assistant/builder@2024.08.2
         with:
           args: |
             --${{ matrix.arch }} \
