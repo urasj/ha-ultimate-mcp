@@ -87,3 +87,23 @@
   cycle: storage_patch detects a patch already reflected in the document
   (including `remove` of a now-absent key), and StorageEditor no-ops when
   the mutated documents equal the originals.
+
+## 0.2.6
+
+- **dashboard_config_save rewritten: storage-mode saves now go through the**
+  `lovelace/config/save` **WS command** (the frontend's own save path)
+  instead of StorageEditor file surgery. The old path was doubly broken:
+  it derived the .storage filename from url_path, but HA stores every
+  dashboard as `lovelace.<id>` (a default dashboard lives at
+  `lovelace.lovelace`, and e.g. url_path `sports-tv` != id `sports_tv`),
+  and core caches .storage in memory anyway, so a direct file write is
+  ignored by the running instance and overwritten on its next flush.
+  Found in the field when the tool could not save the default dashboard.
+- The WS save needs no backup/stop/start cycle: HA validates, persists,
+  and hot-reloads the dashboard itself. Saves are still journaled
+  (write-ahead, `dashboard_ws_save` action) with a pre-image undo
+  artifact (`undo/<undo_id>/dashboard_config.json`); revert by re-saving
+  that config. dry_run now diffs against the live config via
+  `lovelace/config`. YAML-mode dashboards unchanged (atomic file write).
+- Removed `_storage_key` / the StorageEditor path from the dashboards
+  surface; tier stays T2 (checkpoint required) out of caution.
