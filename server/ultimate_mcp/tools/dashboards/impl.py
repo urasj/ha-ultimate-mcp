@@ -1,12 +1,18 @@
 """dashboards/ surface implementation — lazy-imported on first call (W5).
 
 Reads use the lovelace/* WS commands (wrapped so a bad command name degrades to
-{"error": ...}). The one write tool routes storage-mode dashboards through the
-StorageEditor safety spine (backup -> stop -> atomic edit -> verify -> start) and
-YAML-mode dashboards through an atomic file write via ctx.fs.
+{"error": ...}). The write tool saves storage-mode dashboards via the
+lovelace/config/save WS command — the exact path the frontend uses. Direct
+.storage writes are wrong for dashboards: core caches the store in memory,
+ignores external edits, and rewrites the file on its next flush — and the
+storage key is 'lovelace.<id>', which url_path does not reliably give you
+(0.2.5 guessed '.storage/lovelace[.<url_path>]' and broke on every dashboard
+whose id != url_path, including a default dashboard stored as
+'lovelace.lovelace'; fixed in 0.2.6 by not touching files at all).
+YAML-mode dashboards still go through an atomic file write via ctx.fs.
 
 WS command spellings (cross-referenced against homeassistant.components.lovelace
-websocket_api; confirm against the live 2026.7 box):
+websocket_api; confirmed against a live 2026.7 box):
   lovelace/dashboards/list   -> list dashboards
   lovelace/config            -> get a dashboard config (url_path=..., force=false)
   lovelace/resources         -> list resources
@@ -16,13 +22,16 @@ websocket_api; confirm against the live 2026.7 box):
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import secrets
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from ultimate_mcp.context import Context
-from ultimate_mcp.safety.storage_editor import StorageEditor, diff_summary
+from ultimate_mcp.safety.storage_editor import UNDO_ROOT, StorageEditor, diff_summary
 
 _NOTE = "verify lovelace/* WS command for 2026.7"
 
@@ -32,17 +41,6 @@ async def _safe_ws(ctx: Context, command: str, **kwargs: Any) -> tuple[Any, dict
         return await ctx.ha_ws.call(command, **kwargs), None
     except Exception as exc:  # noqa: BLE001 — degrade, never raise from a tool
         return None, {"error": str(exc), "note": _NOTE, "command": command}
-
-
-def _editor(ctx: Context) -> StorageEditor:
-    return StorageEditor(ctx)
-
-
-def _storage_key(url_path: str | None) -> str:
-    """.storage key for a dashboard: 'lovelace' for the default, 'lovelace.<url_path>' otherwise."""
-    if not url_path or url_path in ("lovelace", "default", "overview"):
-        return "lovelace"
-    return f"lovelace.{url_path}"
 
 
 # ------------------------------------------------------------------ T0 reads
@@ -218,37 +216,72 @@ async def dashboard_config_save(
             return {"error": f"write failed: {exc}", "yaml_path": yaml_path}
         return {"dry_run": False, "mode": "yaml", "yaml_path": yaml_path, "written": True, "summary": summary}
 
-    # -------- storage-mode dashboards: via the StorageEditor safety spine ---
-    key = _storage_key(url_path)
+    # -------- storage-mode dashboards: the lovelace/config/save WS command --
+    # No file surgery and no core stop/start: HA validates, persists to the
+    # correct .storage store, and hot-reloads the dashboard itself.
+    kwargs: dict[str, Any] = {}
+    if url_path is not None:
+        kwargs["url_path"] = url_path
 
-    def mutate(data: dict[str, Any]) -> dict[str, Any]:
-        data.setdefault("data", {})
-        data["data"]["config"] = config
-        return data
+    prev, prev_err = await _safe_ws(ctx, "lovelace/config", force=False, **kwargs)
+    prev_config = prev if isinstance(prev, dict) else None
 
     if dry_run:
-        # Provide a structural preview without requiring the .storage file to exist
-        # yet (a brand-new dashboard has no store). Fall back to StorageEditor's
-        # diff when the store is present.
-        try:
-            preview = await _editor(ctx).edit(key, mutate, dry_run=True, name_hint="dashboard-save")
-            preview.update(
-                {"dry_run": True, "mode": "storage", "storage_key": key,
-                 "url_path": url_path, "summary": summary}
+        out: dict[str, Any] = {
+            "dry_run": True,
+            "mode": "storage",
+            "url_path": url_path,
+            "current": _config_summary(prev_config) if prev_config is not None else None,
+            "summary": summary,
+            "note": "re-run with dry_run=false to save via the lovelace/config/save WS command",
+        }
+        if prev_config is not None:
+            out["would_change"] = {"config": diff_summary(prev_config, config)}
+        else:
+            out["note"] = (
+                f"no existing config to diff ({(prev_err or {}).get('error', 'empty store')}); "
+                "dry_run=false would create it via lovelace/config/save"
             )
-            return preview
-        except Exception as exc:  # noqa: BLE001 — store may not exist yet
-            return {
-                "dry_run": True,
-                "mode": "storage",
-                "storage_key": key,
-                "url_path": url_path,
-                "summary": summary,
-                "would_change": {f".storage/{key}": diff_summary({}, {"data": {"config": config}})},
-                "note": f"store not readable yet ({exc}); would create/replace it via the safety spine",
-                "checkpoint_required": "partial:homeassistant",
-            }
+        return out
 
-    result = await _editor(ctx).edit(key, mutate, dry_run=False, name_hint="dashboard-save")
-    result.update({"mode": "storage", "storage_key": key, "url_path": url_path, "summary": summary})
-    return result
+    # Pre-image undo artifact + write-ahead journal entry. This save bypasses
+    # the StorageEditor spine (deliberately), so journal here to keep every
+    # mutation discoverable and reversible.
+    undo_id: str | None = None
+    if prev_config is not None:
+        undo_id = f"{int(time.time())}-{secrets.token_hex(4)}"
+        undo_dir = UNDO_ROOT / undo_id
+        undo_dir.mkdir(parents=True, exist_ok=True)
+        (undo_dir / "dashboard_config.json").write_text(
+            json.dumps({"url_path": url_path, "config": prev_config}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    entry_id = StorageEditor._journal(
+        {
+            "action": "dashboard_ws_save",
+            "status": "pending",
+            "hint": "dashboard-save",
+            "url_path": url_path,
+            "undo_id": undo_id,
+            "diff": diff_summary(prev_config or {}, config),
+            "undo_hint": "to revert, dashboard_config_save the config stored in "
+            "undo/<undo_id>/dashboard_config.json",
+        }
+    )
+
+    _saved, err = await _safe_ws(ctx, "lovelace/config/save", config=config, **kwargs)
+    if err is not None:
+        StorageEditor._journal_update(entry_id, status="failed", error=err.get("error"))
+        return err
+    StorageEditor._journal_update(entry_id, status="committed")
+
+    verify, _verify_err = await _safe_ws(ctx, "lovelace/config", force=True, **kwargs)
+    return {
+        "applied": True,
+        "mode": "storage",
+        "url_path": url_path,
+        "summary": summary,
+        "verified": isinstance(verify, dict) and _config_summary(verify) == summary,
+        "undo_id": undo_id,
+        "journal_id": entry_id,
+    }
