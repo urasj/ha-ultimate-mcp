@@ -1,14 +1,15 @@
 """dashboards/ surface tests (W5).
 
-StubWs records ctx.ha_ws.call for the lovelace/* read commands; the save tool is
-exercised through a real FsFacade + StubSupervisor so the StorageEditor spine
-runs end to end. Env is pinned before importing ultimate_mcp (DATA_DIR is used
-for undo copies / journal).
+StubWs records ctx.ha_ws.call for the lovelace/* commands. The save tool is
+WS-based as of 0.2.6 (lovelace/config/save — the frontend's own save path), so
+the storage-mode tests assert the WS call, the journal entry, and the pre-image
+undo artifact instead of the old StorageEditor file-surgery spine. YAML-mode
+still goes through a real FsFacade. Env is pinned before importing ultimate_mcp
+(DATA_DIR is used for undo copies / journal).
 """
 
 import asyncio
 import inspect
-import json
 import os
 import sys
 import tempfile
@@ -23,6 +24,7 @@ os.environ["UMCP_DATA"] = str(Path(_SANDBOX) / "data")
 sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
 
 from ultimate_mcp.context import FsFacade  # noqa: E402
+from ultimate_mcp.safety.storage_editor import UNDO_ROOT  # noqa: E402
 from ultimate_mcp.tools.dashboards import impl  # noqa: E402
 from ultimate_mcp.tools.dashboards.manifest import SURFACE  # noqa: E402
 from ultimate_mcp.ws import HaWsError  # noqa: E402
@@ -49,13 +51,6 @@ RESPONSES = {
     "lovelace/dashboards/list": DASHBOARDS,
     "lovelace/config": DASH_CONFIG,
     "lovelace/resources": RESOURCES,
-}
-
-LOVELACE_STORE = {
-    "version": 1,
-    "minor_version": 1,
-    "key": "lovelace",
-    "data": {"config": {"views": [{"title": "Old", "cards": []}]}},
 }
 
 
@@ -100,12 +95,6 @@ class StubCtx:
         self.supervisor = StubSupervisor()
 
 
-def _build_store(root: Path) -> None:
-    storage = root / ".storage"
-    storage.mkdir(parents=True)
-    (storage / "lovelace").write_text(json.dumps(LOVELACE_STORE, indent=2), encoding="utf-8")
-
-
 # --------------------------------------------------------------- contract
 def test_manifest_impl_parity():
     for spec in SURFACE.tools:
@@ -147,32 +136,52 @@ def test_dashboard_card_lint_flags_missing_type():
 
 
 # --------------------------------------------------------------- T2 save
-def test_dashboard_config_save_dry_run(tmp_path):
-    root = tmp_path / "config"
-    root.mkdir()
-    _build_store(root)
-    ctx = StubCtx(root=root)
+def test_dashboard_config_save_dry_run_diffs_live_config():
+    ws = StubWs(responses={**RESPONSES, "lovelace/config/save": {"success": True}})
+    ctx = StubCtx(ws=ws)
     new_config = {"views": [{"title": "Fresh", "cards": [{"type": "markdown", "content": "hi"}]}]}
     out = asyncio.run(impl.dashboard_config_save(ctx, new_config, url_path=None))
     assert out["dry_run"] is True
     assert out["mode"] == "storage"
-    assert out["storage_key"] == "lovelace"
     assert out["summary"] == {"view_count": 1, "card_count": 1}
-    assert out["checkpoint_required"] == "partial:homeassistant"
-    # dry run touched nothing
+    assert out["current"] == {"view_count": 1, "card_count": 3}
+    assert "would_change" in out
+    # dry run is read-only: no save command was issued, no supervisor calls
+    assert all(cmd != "lovelace/config/save" for cmd, _ in ws.calls)
     assert ctx.supervisor.calls == []
-    assert ctx.fs.read_storage("lovelace")["data"]["config"]["views"][0]["title"] == "Old"
 
 
-def test_dashboard_config_save_execute_via_editor(tmp_path):
-    root = tmp_path / "config"
-    root.mkdir()
-    _build_store(root)
-    ctx = StubCtx(root=root)
+def test_dashboard_config_save_execute_via_ws():
+    saves: list[dict] = []
+
+    def record_save(kwargs):
+        saves.append(kwargs)
+        return {"success": True}
+
+    ws = StubWs(responses={**RESPONSES, "lovelace/config/save": record_save})
+    ctx = StubCtx(ws=ws)
     new_config = {"views": [{"title": "Fresh", "cards": []}]}
-    out = asyncio.run(impl.dashboard_config_save(ctx, new_config, url_path=None, dry_run=False))
-    assert ctx.supervisor.posts() == ["/backups/new/partial", "/core/stop", "/core/start"]
-    assert ctx.fs.read_storage("lovelace")["data"]["config"]["views"][0]["title"] == "Fresh"
+    out = asyncio.run(impl.dashboard_config_save(ctx, new_config, url_path="admin", dry_run=False))
+    assert out["applied"] is True
+    assert saves == [{"config": new_config, "url_path": "admin"}]
+    # the WS path replaces the old file-surgery spine: no backup, no core stop/start
+    assert ctx.supervisor.calls == []
+    # journaled, with a pre-image undo artifact of the previous config
+    assert out.get("journal_id")
+    assert out.get("undo_id")
+    undo_file = UNDO_ROOT / out["undo_id"] / "dashboard_config.json"
+    assert undo_file.is_file()
+    assert "Home" in undo_file.read_text(encoding="utf-8")
+
+
+def test_dashboard_config_save_ws_error_degrades():
+    ws = StubWs()  # no lovelace/config/save in responses -> raises
+    ctx = StubCtx(ws=ws)
+    out = asyncio.run(
+        impl.dashboard_config_save(ctx, {"views": []}, url_path="admin", dry_run=False)
+    )
+    assert "error" in out and out["command"] == "lovelace/config/save"
+    assert ctx.supervisor.calls == []
 
 
 def test_dashboard_config_save_yaml_mode(tmp_path):
