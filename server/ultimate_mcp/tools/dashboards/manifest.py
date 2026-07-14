@@ -1,8 +1,9 @@
 """dashboards/ surface manifest — Lovelace dashboards (W5).
 
 Pure data; loaded at startup. Reads use the lovelace/* WS commands. The single
-write tool (dashboard_config_save) routes storage-mode dashboards through the
-StorageEditor safety spine and YAML-mode dashboards through an atomic file write.
+write tool (dashboard_config_save) saves storage-mode dashboards via the
+lovelace/config/save WS command (journaled, with a pre-image undo artifact) and
+YAML-mode dashboards through an atomic file write.
 No gates: Lovelace is always present.
 """
 
@@ -18,7 +19,7 @@ _URL_PATH = {
 SURFACE = SurfaceSpec(
     name="dashboards",
     summary="Lovelace dashboards: list dashboards, fetch a dashboard's config, list resources, "
-    "lint card structure, and save a dashboard config via the safety spine",
+    "lint card structure, and save a dashboard config via the lovelace/config/save WS command",
     impl_module="ultimate_mcp.tools.dashboards.impl",
     requires=(),  # Lovelace is always present
     tools=(
@@ -60,8 +61,9 @@ SURFACE = SurfaceSpec(
         # --------------------------------------------------------- T2 save
         ToolSpec(
             name="dashboard_config_save",
-            summary="Save a full dashboard config. Storage-mode dashboards go through the "
-            "StorageEditor safety spine; YAML-mode via atomic file write. dry_run shows a summary.",
+            summary="Save a full dashboard config. Storage-mode via the lovelace/config/save "
+            "WS command (journaled, pre-image undo artifact, no core restart); YAML-mode via "
+            "atomic file write. dry_run shows a diff against the live config.",
             tier=Tier.T2_RISKY,
             schema={
                 "type": "object",
@@ -72,7 +74,7 @@ SURFACE = SurfaceSpec(
                         "type": "string",
                         "enum": ["storage", "yaml"],
                         "default": "storage",
-                        "description": "storage -> StorageEditor on the lovelace .storage key; "
+                        "description": "storage -> lovelace/config/save WS command; "
                         "yaml -> atomic write of yaml_path",
                     },
                     "yaml_path": {
